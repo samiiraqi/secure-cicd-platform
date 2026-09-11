@@ -1,0 +1,13 @@
+github_org  = "your-github-org-or-username"
+github_repo = "secure-cicd-platform"
+
+# From `./scripts/bootstrap-backend.sh` output.
+state_bucket_name     = "secure-cicd-tfstate-123456789012"
+state_lock_table_name = "secure-cicd-tf-locks"
+
+aws_region = "us-east-1"
+
+# Leave true unless this AWS account already has a GitHub OIDC provider
+# from another project (AWS allows only one per URL per account).
+create_oidc_provider = true
+# existing_oidc_provider_arn = "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"

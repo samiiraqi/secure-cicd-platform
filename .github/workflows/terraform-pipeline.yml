@@ -1,0 +1,323 @@
+name: Terraform Pipeline
+
+# Stages: lint -> security scan -> terraform plan -> manual approval -> terraform apply
+#
+# - Pull requests: lint, security-scan, and plan for both environments run
+#   automatically; the plan is posted as a PR comment. Nothing is applied.
+# - Pushes to main: the same, plus apply-staging (auto) and apply-production
+#   (gated by the "production" GitHub Environment's required-reviewers rule
+#   - see bootstrap/github-oidc/README.md).
+# - Authenticates to AWS via OIDC (no access keys stored in GitHub) - see
+#   bootstrap/github-oidc/.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "modules/**"
+      - "environments/**"
+      - ".github/workflows/terraform-pipeline.yml"
+  push:
+    branches: [main]
+    paths:
+      - "modules/**"
+      - "environments/**"
+      - ".github/workflows/terraform-pipeline.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.7.5"
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+concurrency:
+  group: terraform-pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1. Lint
+  # ---------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive
+
+      - name: terraform validate (staging)
+        working-directory: environments/staging
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - name: terraform validate (production)
+        working-directory: environments/production
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: tflint
+        # Informational for now - no .tflint.hcl ruleset has been tuned for
+        # this repo yet, so findings are surfaced without failing the build.
+        continue-on-error: true
+        run: |
+          tflint --init
+          tflint --recursive
+
+  # ---------------------------------------------------------------------
+  # 2. Security scan - tfsec + checkov (IaC) and gitleaks (secrets).
+  #    Hard gate: any CRITICAL/HIGH tfsec finding or failed checkov check
+  #    blocks the pipeline. See modules/*/README.md and inline
+  #    `tfsec:ignore` / `#checkov:skip` comments for the documented,
+  #    intentional exceptions already baked into this codebase.
+  # ---------------------------------------------------------------------
+  security-scan:
+    name: Security scan (tfsec, checkov, gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+      - name: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: modules
+          soft_fail: false
+
+      - name: tfsec (bootstrap)
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: bootstrap
+          soft_fail: false
+
+      - name: checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform
+          quiet: true
+          soft_fail: false
+
+  # ---------------------------------------------------------------------
+  # 3. Plan - staging
+  # ---------------------------------------------------------------------
+  plan-staging:
+    name: Plan (staging)
+    needs: [lint, security-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-plan-staging
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform init
+        working-directory: environments/staging
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: terraform plan
+        id: plan
+        working-directory: environments/staging
+        run: terraform plan -input=false -out=tfplan | tee plan.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-staging
+          path: environments/staging/tfplan
+          retention-days: 5
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('environments/staging/plan.txt', 'utf8').slice(-60000);
+            const body = `### Terraform Plan - staging\n<details><summary>Show plan</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n</details>`;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+  # ---------------------------------------------------------------------
+  # 4. Plan - production
+  # ---------------------------------------------------------------------
+  plan-production:
+    name: Plan (production)
+    needs: [lint, security-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-plan-production
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform init
+        working-directory: environments/production
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: terraform plan
+        working-directory: environments/production
+        run: terraform plan -input=false -out=tfplan | tee plan.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-production
+          path: environments/production/tfplan
+          retention-days: 5
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('environments/production/plan.txt', 'utf8').slice(-60000);
+            const body = `### Terraform Plan - production\n<details><summary>Show plan</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n</details>`;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+  # ---------------------------------------------------------------------
+  # 5. Apply - staging (auto, no manual approval per environments/*/README)
+  # ---------------------------------------------------------------------
+  apply-staging:
+    name: Apply (staging)
+    if: github.event_name != 'pull_request'
+    needs: [plan-staging]
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-apply-staging
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform init
+        working-directory: environments/staging
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-staging
+          path: environments/staging
+
+      - name: terraform apply
+        working-directory: environments/staging
+        run: terraform apply -input=false -auto-approve tfplan
+
+  # ---------------------------------------------------------------------
+  # 6. Apply - production (manual approval via the GitHub Environment's
+  #    required-reviewers protection rule - configure this in Settings >
+  #    Environments > production. Nothing in this YAML enforces it; the
+  #    Environment's own protection rule pauses this job until approved.)
+  # ---------------------------------------------------------------------
+  apply-production:
+    name: Apply (production)
+    if: github.event_name != 'pull_request'
+    needs: [plan-production, apply-staging]
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-apply-production
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform init
+        working-directory: environments/production
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-production
+          path: environments/production
+
+      - name: terraform apply
+        working-directory: environments/production
+        run: terraform apply -input=false -auto-approve tfplan

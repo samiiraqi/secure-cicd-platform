@@ -1,0 +1,140 @@
+name: Docker Build & Scan
+
+# Builds the demo app image, scans it with Trivy (hard gate on
+# CRITICAL/HIGH), and - outside pull requests - pushes it to the target
+# environment's ECR repo and rolls the ECS service to the new image.
+#
+# - Pull requests: build + scan only. No AWS credentials are used.
+# - Push to main: build + scan + deploy to *staging* (no approval, per
+#   environments/staging - staging is meant to be pushed to freely).
+# - Manual dispatch: build + scan + deploy to whichever environment you
+#   pick - production is gated by that GitHub Environment's
+#   required-reviewers rule, same as the Terraform pipeline.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "app/**"
+      - ".github/workflows/docker-build-scan.yml"
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - ".github/workflows/docker-build-scan.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to build, scan and deploy to"
+        type: choice
+        options: [staging, production]
+        default: staging
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  PROJECT_NAME: ${{ vars.PROJECT_NAME || 'secure-cicd' }}
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Pull requests: build + scan only, no cloud access needed.
+  # ---------------------------------------------------------------------
+  build-and-scan:
+    name: Build & scan (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        working-directory: app
+        run: docker build -t demo-app:pr .
+
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: demo-app:pr
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+  # ---------------------------------------------------------------------
+  # Push to main / manual dispatch: build, scan, push, deploy.
+  # ---------------------------------------------------------------------
+  build-scan-deploy:
+    name: Build, scan & deploy
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'staging' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set environment name
+        id: vars
+        run: |
+          ENV_NAME="${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'staging' }}"
+          echo "environment=${ENV_NAME}" >> "$GITHUB_OUTPUT"
+          echo "name_prefix=${{ env.PROJECT_NAME }}-${ENV_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        working-directory: app
+        run: docker build -t demo-app:${{ github.sha }} .
+
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: demo-app:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-docker-deploy-${{ steps.vars.outputs.environment }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Tag & push image
+        env:
+          ECR_REPOSITORY: ${{ steps.vars.outputs.name_prefix }}-app
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          docker tag demo-app:${{ github.sha }} "${REGISTRY}/${ECR_REPOSITORY}:${{ github.sha }}"
+          docker tag demo-app:${{ github.sha }} "${REGISTRY}/${ECR_REPOSITORY}:latest"
+          docker push "${REGISTRY}/${ECR_REPOSITORY}:${{ github.sha }}"
+          docker push "${REGISTRY}/${ECR_REPOSITORY}:latest"
+
+      - name: Fetch current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ steps.vars.outputs.name_prefix }}" \
+            --query 'taskDefinition' \
+            | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+            > task-definition.json
+
+      - name: Render new task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: app
+          image: ${{ steps.ecr-login.outputs.registry }}/${{ steps.vars.outputs.name_prefix }}-app:${{ github.sha }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ steps.vars.outputs.name_prefix }}
+          service: ${{ steps.vars.outputs.name_prefix }}-svc
+          wait-for-service-stability: true
