@@ -1,0 +1,12 @@
+title = "gitleaks config - Secure CI/CD Platform"
+
+[extend]
+useDefault = true
+
+# Project-specific allowlist: keep tight, prefer fixing findings over ignoring them.
+[allowlist]
+description = "Global allowlist"
+paths = [
+  '''\.terraform/.*''',
+  '''(^|/)docs/screenshots/.*''',
+]
