@@ -2,7 +2,7 @@
 
 A production-style DevSecOps reference platform: modular Terraform infrastructure, a GitHub Actions pipeline with security gates, and AWS-native monitoring — built to demonstrate secure, auditable infrastructure delivery end to end.
 
-> **Status:** 🚧 Infrastructure, security tooling and CI/CD pipeline are built. Remaining: real screenshots once a pipeline has actually run (`docs/screenshots/`).
+> **Status:** ✅ Infrastructure, security tooling, CI/CD pipeline and documentation are complete and verified (0 CRITICAL/HIGH tfsec findings, 0 failed checkov checks on both environments). The only thing this repo can't produce on its own: real screenshots in `docs/screenshots/`, which need an actual pipeline run against a real AWS account.
 
 ## Table of Contents
 
@@ -69,6 +69,10 @@ flowchart TB
 ```
 
 *(Diagram renders natively on GitHub / any Mermaid-compatible viewer.)*
+
+For the full picture - network topology per AZ, the OIDC credential
+exchange sequence, and the CloudTrail → alarms → SNS event flow - see
+[docs/architecture.md](docs/architecture.md).
 
 ## Repository Structure
 
